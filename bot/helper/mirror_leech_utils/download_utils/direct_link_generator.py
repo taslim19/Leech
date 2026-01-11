@@ -4,7 +4,7 @@ from http.cookiejar import MozillaCookieJar
 from json import loads
 from lxml.etree import HTML
 from os import path as ospath
-from re import findall, match, search
+from re import findall, match, search, IGNORECASE
 from requests import Session, post, get, RequestException
 from requests.adapters import HTTPAdapter
 from time import sleep
@@ -205,6 +205,8 @@ def direct_link_generator(link):
         return swisstransfer(link)
     elif "instagram.com" in domain:
         return instagram(link)
+    elif "transfer.it" in domain:
+        return transferit(link)
     elif any(x in domain for x in ["akmfiles.com", "akmfls.xyz"]):
         return akmfiles(link)
     elif any(
@@ -2046,3 +2048,181 @@ def instagram(link: str) -> str:
 
     except Exception as e:
         raise DirectDownloadLinkException(f"ERROR: {e}")
+
+
+def transferit(url: str):
+    """
+    Generate a direct download link for transfer.it URLs.
+    
+    Args:
+        url: transfer.it URL (e.g., https://transfer.it/t/Yv5ANd8zgJCb or https://transfer.it/t/Yv5ANd8zgJCb::password)
+    
+    Returns:
+        Direct download link or dict with contents for multiple files
+    """
+    if "::" in url:
+        _password = url.split("::")[-1]
+        url = url.split("::")[-2]
+    else:
+        _password = ""
+    
+    # Extract transfer ID from URL
+    parsed_url = urlparse(url)
+    path_parts = [p for p in parsed_url.path.strip("/").split("/") if p]
+    
+    if not path_parts or path_parts[0] != "t" or len(path_parts) < 2:
+        raise DirectDownloadLinkException("ERROR: Invalid transfer.it URL format")
+    
+    transfer_id = path_parts[1]
+    
+    with create_scraper() as session:
+        try:
+            headers = {
+                "User-Agent": user_agent,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Referer": "https://transfer.it/",
+            }
+            
+            # Get the transfer page
+            response = session.get(url, headers=headers)
+            response.raise_for_status()
+            
+            html = HTML(response.text)
+            
+            # Check if password is required
+            password_inputs = html.xpath("//input[@type='password']")
+            if password_inputs and not _password:
+                raise DirectDownloadLinkException(
+                    f"ERROR:\n{PASSWORD_ERROR_MESSAGE.format(url)}"
+                )
+            
+            # Submit password if provided
+            if _password and password_inputs:
+                form_data = {}
+                form_inputs = html.xpath("//form//input")
+                for inp in form_inputs:
+                    name = inp.get("name")
+                    if name:
+                        form_data[name] = inp.get("value", "")
+                
+                password_name = password_inputs[0].get("name", "password")
+                form_data[password_name] = _password
+                
+                form_action = html.xpath("//form/@action")
+                if form_action:
+                    action_url = form_action[0]
+                    if not action_url.startswith("http"):
+                        action_url = f"{parsed_url.scheme}://{parsed_url.netloc}{action_url}"
+                else:
+                    action_url = url
+                
+                response = session.post(action_url, data=form_data, headers=headers)
+                response.raise_for_status()
+                html = HTML(response.text)
+                
+                if html.xpath("//input[@type='password']"):
+                    raise DirectDownloadLinkException("ERROR: Wrong password.")
+            
+            # Try to extract download link from page
+            # Look for download buttons/links
+            download_links = html.xpath(
+                "//a[contains(@class, 'download') or contains(text(), 'Download')]/@href"
+            )
+            if download_links:
+                dl_link = download_links[0]
+                if not dl_link.startswith("http"):
+                    dl_link = f"{parsed_url.scheme}://{parsed_url.netloc}{dl_link}"
+                return dl_link
+            
+            # Look for download buttons with data attributes
+            download_buttons = html.xpath(
+                "//button[contains(@class, 'download') or contains(text(), 'Download')]"
+            )
+            for button in download_buttons:
+                onclick = button.get("onclick", "")
+                if onclick:
+                    # Extract URL from onclick
+                    url_match = findall(r'["\'](https?://[^"\']+)["\']', onclick)
+                    if url_match:
+                        return url_match[0]
+                
+                data_url = button.get("data-url") or button.get("data-download-url") or button.get("data-href")
+                if data_url:
+                    if not data_url.startswith("http"):
+                        data_url = f"{parsed_url.scheme}://{parsed_url.netloc}{data_url}"
+                    return data_url
+            
+            # Look in scripts for download URLs
+            scripts = html.xpath("//script/text()")
+            for script in scripts:
+                # Look for download URL patterns in JavaScript
+                patterns = [
+                    r'["\'](https?://[^"\']*download[^"\']*transfer[^"\']*)["\']',
+                    r'["\'](https?://[^"\']*transfer[^"\']*download[^"\']*)["\']',
+                    r'downloadUrl["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                    r'url["\']?\s*[:=]\s*["\'](https?://[^"\']*transfer[^"\']*)["\']',
+                ]
+                for pattern in patterns:
+                    matches = findall(pattern, script, IGNORECASE)
+                    if matches:
+                        return matches[0]
+            
+            # Try API endpoints
+            api_endpoints = [
+                f"https://transfer.it/api/v1/transfers/{transfer_id}/download",
+                f"https://transfer.it/api/transfers/{transfer_id}/download",
+                f"https://transfer.it/api/v1/transfers/{transfer_id}",
+            ]
+            
+            if _password:
+                api_endpoints = [f"{ep}?password={_password}" for ep in api_endpoints]
+            
+            for api_endpoint in api_endpoints:
+                try:
+                    api_response = session.get(api_endpoint, headers=headers, allow_redirects=False)
+                    if api_response.status_code in [200, 302, 307, 308]:
+                        if "Location" in api_response.headers:
+                            return api_response.headers["Location"]
+                        elif api_response.status_code == 200:
+                            try:
+                                data = api_response.json()
+                                if isinstance(data, dict):
+                                    if "download_url" in data:
+                                        return data["download_url"]
+                                    elif "url" in data:
+                                        return data["url"]
+                                    elif "files" in data:
+                                        details = {
+                                            "contents": [],
+                                            "title": data.get("name", "transfer"),
+                                            "total_size": 0,
+                                        }
+                                        for file in data["files"]:
+                                            file_url = file.get("download_url") or file.get("url")
+                                            if file_url:
+                                                details["contents"].append({
+                                                    "filename": file.get("name", "file"),
+                                                    "path": "",
+                                                    "url": file_url,
+                                                })
+                                                if "size" in file:
+                                                    details["total_size"] += file["size"]
+                                        if len(details["contents"]) == 1:
+                                            return details["contents"][0]["url"]
+                                        return details
+                            except:
+                                # If not JSON, might be direct download
+                                if api_response.status_code == 200:
+                                    return api_endpoint
+                except:
+                    continue
+            
+            raise DirectDownloadLinkException(
+                "ERROR: Could not find download link. The transfer may be expired or invalid."
+            )
+            
+        except DirectDownloadLinkException:
+            raise
+        except Exception as e:
+            raise DirectDownloadLinkException(f"ERROR: {e.__class__.__name__}: {str(e)}")
