@@ -431,6 +431,15 @@ class Mirror(TaskListener):
         elif is_mega_link(self.link):
             await add_mega_download(self, f"{path}/")
         else:
+            # Add headers for Mega CDN direct download links
+            if "userstorage.mega.co.nz" in self.link or "mega.co.nz/dl" in self.link:
+                if not headers:
+                    headers = ""
+                if "referer" not in headers.lower():
+                    headers += " referer: https://mega.nz/"
+                if "user-agent" not in headers.lower():
+                    headers += " user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            
             ussr = args["-au"]
             pssw = args["-ap"]
             if ussr or pssw:
