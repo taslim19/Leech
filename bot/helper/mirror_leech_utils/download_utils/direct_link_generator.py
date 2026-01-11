@@ -2090,6 +2090,19 @@ def transferit(url: str):
             
             html = HTML(response.text)
             
+            # Check for meta tags or data attributes that might contain download info
+            meta_tags = html.xpath("//meta[@name='download-url' or @property='download-url']/@content")
+            if meta_tags:
+                return meta_tags[0]
+            
+            # Check for data attributes in body or root element
+            body_data = html.xpath("//body/@data-download-url | //html/@data-download-url")
+            if body_data:
+                dl_url = body_data[0]
+                if not dl_url.startswith("http"):
+                    dl_url = f"{parsed_url.scheme}://{parsed_url.netloc}{dl_url}"
+                return dl_url
+            
             # Check if password is required
             password_inputs = html.xpath("//input[@type='password']")
             if password_inputs and not _password:
@@ -2168,19 +2181,68 @@ def transferit(url: str):
                     if matches:
                         return matches[0]
             
-            # Try API endpoints
+            # Try to extract API endpoints from secureboot.js or other scripts
+            script_srcs = html.xpath("//script/@src")
+            for script_src in script_srcs:
+                if "secureboot" in script_src.lower() or "transfer" in script_src.lower():
+                    try:
+                        if not script_src.startswith("http"):
+                            script_src = f"{parsed_url.scheme}://{parsed_url.netloc}{script_src}"
+                        script_response = session.get(script_src, headers=headers)
+                        if script_response.status_code == 200:
+                            script_content = script_response.text
+                            # Look for API endpoints in the JavaScript
+                            api_patterns = [
+                                r'["\'](/api[^"\']+)["\']',
+                                r'["\'](https?://[^"\']*api[^"\']*transfer[^"\']*)["\']',
+                                r'apiUrl["\']?\s*[:=]\s*["\']([^"\']+)["\']',
+                                r'endpoint["\']?\s*[:=]\s*["\']([^"\']+)["\']',
+                            ]
+                            for pattern in api_patterns:
+                                matches = findall(pattern, script_content, IGNORECASE)
+                                for match in matches:
+                                    if not match.startswith("http"):
+                                        match = f"{parsed_url.scheme}://{parsed_url.netloc}{match}"
+                                    # Try this endpoint
+                                    try:
+                                        test_response = session.get(match, headers=headers, allow_redirects=False)
+                                        if test_response.status_code in [200, 302, 307, 308]:
+                                            if "Location" in test_response.headers:
+                                                return test_response.headers["Location"]
+                                    except:
+                                        continue
+                    except:
+                        continue
+            
+            # Try API endpoints - common patterns for transfer.it
             api_endpoints = [
                 f"https://transfer.it/api/v1/transfers/{transfer_id}/download",
                 f"https://transfer.it/api/transfers/{transfer_id}/download",
                 f"https://transfer.it/api/v1/transfers/{transfer_id}",
+                f"https://transfer.it/api/transfers/{transfer_id}",
+                f"https://transfer.it/download/{transfer_id}",
+                f"https://transfer.it/t/{transfer_id}/download",
             ]
             
             if _password:
-                api_endpoints = [f"{ep}?password={_password}" for ep in api_endpoints]
+                # Try with password as query param
+                api_endpoints.extend([f"{ep}?password={_password}" for ep in api_endpoints[:3]])
+                # Try with password in POST
+                api_endpoints.append(f"https://transfer.it/api/v1/transfers/{transfer_id}/download")
             
             for api_endpoint in api_endpoints:
                 try:
-                    api_response = session.get(api_endpoint, headers=headers, allow_redirects=False)
+                    if _password and api_endpoint.endswith("/download") and "?" not in api_endpoint:
+                        # Try POST with password
+                        api_response = session.post(
+                            api_endpoint,
+                            json={"password": _password},
+                            headers={**headers, "Content-Type": "application/json"},
+                            allow_redirects=False
+                        )
+                    else:
+                        api_response = session.get(api_endpoint, headers=headers, allow_redirects=False)
+                    
                     if api_response.status_code in [200, 302, 307, 308]:
                         if "Location" in api_response.headers:
                             return api_response.headers["Location"]
@@ -2192,6 +2254,8 @@ def transferit(url: str):
                                         return data["download_url"]
                                     elif "url" in data:
                                         return data["url"]
+                                    elif "downloadUrl" in data:
+                                        return data["downloadUrl"]
                                     elif "files" in data:
                                         details = {
                                             "contents": [],
@@ -2199,7 +2263,7 @@ def transferit(url: str):
                                             "total_size": 0,
                                         }
                                         for file in data["files"]:
-                                            file_url = file.get("download_url") or file.get("url")
+                                            file_url = file.get("download_url") or file.get("url") or file.get("downloadUrl")
                                             if file_url:
                                                 details["contents"].append({
                                                     "filename": file.get("name", "file"),
@@ -2211,10 +2275,19 @@ def transferit(url: str):
                                         if len(details["contents"]) == 1:
                                             return details["contents"][0]["url"]
                                         return details
+                                    elif "data" in data and isinstance(data["data"], dict):
+                                        # Nested data structure
+                                        if "download_url" in data["data"]:
+                                            return data["data"]["download_url"]
+                                        elif "url" in data["data"]:
+                                            return data["data"]["url"]
                             except:
                                 # If not JSON, might be direct download
                                 if api_response.status_code == 200:
-                                    return api_endpoint
+                                    # Check content-type
+                                    content_type = api_response.headers.get("Content-Type", "")
+                                    if "application/json" not in content_type.lower():
+                                        return api_endpoint
                 except:
                     continue
             
