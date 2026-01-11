@@ -28,7 +28,12 @@ def is_telegram_link(url: str):
 
 
 def is_mega_link(url: str):
-    return "mega.nz" in url or "mega.co.nz" in url
+    # Only match Mega share links, not direct download links
+    # Mega share links: https://mega.nz/file/... or https://mega.nz/folder/...
+    # Direct download links: https://*.userstorage.mega.co.nz/dl/... should be treated as regular downloads
+    if "userstorage.mega.co.nz" in url or "mega.co.nz/dl" in url:
+        return False
+    return "mega.nz" in url or ("mega.co.nz" in url and "/file/" in url or "/folder/" in url or "/#F!" in url or "/#!" in url)
 
 
 def get_mega_link_type(url):
